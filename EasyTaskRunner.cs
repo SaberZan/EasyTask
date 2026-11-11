@@ -39,6 +39,7 @@ namespace Easy
         void Unuse();
         void Retain();
         void Release();
+        void Forget();
         bool IsFree();
     }
 
@@ -111,6 +112,7 @@ namespace Easy
         private static long runnerGeneration;
         private static bool isStartThreadTiming;
         private static bool isResetting;
+        private static int unlockedTaskOperations;
         private static CancellationTokenSource threadCancellation;
         private static Task threadPoolPump;
 
@@ -128,6 +130,30 @@ namespace Easy
         {
             get { return Volatile.Read(ref isStartThreadTiming); }
             private set { Volatile.Write(ref isStartThreadTiming, value); }
+        }
+
+        internal static bool RequiresTaskSynchronization
+        {
+            get { return IsStartThreadTiming || Volatile.Read(ref isResetting); }
+        }
+
+        internal static void EnterUnlockedTaskOperation()
+        {
+            Interlocked.Increment(ref unlockedTaskOperations);
+        }
+
+        internal static void ExitUnlockedTaskOperation()
+        {
+            Interlocked.Decrement(ref unlockedTaskOperations);
+        }
+
+        private static void WaitForUnlockedTaskOperations()
+        {
+            SpinWait spin = new SpinWait();
+            while (Volatile.Read(ref unlockedTaskOperations) != 0)
+            {
+                spin.SpinOnce();
+            }
         }
 
         internal static bool IsMainThread
@@ -185,6 +211,7 @@ namespace Easy
                 }
                 isResetting = true;
                 IsStartThreadTiming = false;
+                WaitForUnlockedTaskOperations();
                 cancellation = threadCancellation;
                 pump = threadPoolPump;
                 runnerThread = thread;
@@ -277,6 +304,7 @@ namespace Easy
                 threadCancellation = new CancellationTokenSource();
                 CancellationToken token = threadCancellation.Token;
                 IsStartThreadTiming = true;
+                WaitForUnlockedTaskOperations();
 
                 if (threadMode == ThreadMode.RunInThreadPool)
                 {

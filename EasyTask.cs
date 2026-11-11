@@ -7,8 +7,60 @@ using System.Threading;
 
 namespace Easy
 {
+    internal interface IEasyTaskSynchronization
+    {
+        bool RequiresSynchronization { get; }
+    }
+
+    internal readonly struct EasyTaskLock : IDisposable
+    {
+        private readonly object syncRoot;
+        private readonly bool lockTaken;
+        private readonly bool unlockedOperation;
+
+        internal EasyTaskLock(object syncRoot, IEasyTaskSynchronization owner)
+        {
+            this.syncRoot = syncRoot;
+            lockTaken = false;
+            unlockedOperation = false;
+
+            if (!owner.RequiresSynchronization)
+            {
+                // A lifecycle transition waits for registered unlocked operations
+                // before it lets another thread access the same tasks.
+                EasyTaskRunner.EnterUnlockedTaskOperation();
+                if (!owner.RequiresSynchronization)
+                {
+                    unlockedOperation = true;
+                    return;
+                }
+                EasyTaskRunner.ExitUnlockedTaskOperation();
+            }
+
+            Monitor.Enter(syncRoot);
+            lockTaken = true;
+        }
+
+        internal bool IsLockTaken
+        {
+            get { return lockTaken; }
+        }
+
+        public void Dispose()
+        {
+            if (unlockedOperation)
+            {
+                EasyTaskRunner.ExitUnlockedTaskOperation();
+            }
+            else if (lockTaken)
+            {
+                Monitor.Exit(syncRoot);
+            }
+        }
+    }
+
     [AsyncMethodBuilder(typeof(EasyAsyncGenericTaskMethodBuider<>))]
-    public class EasyTask<T> : IEasyTaskInterface, IEasyTaskException, ICriticalNotifyCompletion, IEasyTaskScheduleState
+    public class EasyTask<T> : IEasyTaskInterface, IEasyTaskException, ICriticalNotifyCompletion, IEasyTaskScheduleState, IEasyTaskSynchronization
     {
         protected static readonly ConcurrentQueue<EasyTask<T>> queue = new ConcurrentQueue<EasyTask<T>>();
 
@@ -18,6 +70,9 @@ namespace Easy
         private Action callback;
         private bool hasBeenUsed;
         private bool isScheduled;
+        private bool isForgotten;
+        private bool awaiterRegistered;
+        private bool synchronizationRequired;
 
         protected T result;
         protected bool autoRecycle;
@@ -74,14 +129,14 @@ namespace Easy
 
         public EasyCancellationToken EasyCancellationToken
         {
-            get { lock (syncRoot) { return cancellationToken; } }
+            get { using (CreateLock()) { return cancellationToken; } }
         }
 
         private EasyCancellationToken cancellationToken;
 
         public Exception Exception
         {
-            get { lock (syncRoot) { return exception == null ? null : exception.SourceException; } }
+            get { using (CreateLock()) { return exception == null ? null : exception.SourceException; } }
         }
 
         public bool IsCompleted
@@ -92,7 +147,7 @@ namespace Easy
         public virtual void Reuse(Timing timing, bool autoRecycle)
         {
             Timing checkedTiming = CheckTiming(timing);
-            lock (syncRoot)
+            using (CreateLock())
             {
                 if (isScheduled || (hasBeenUsed && !isInPool))
                 {
@@ -105,6 +160,8 @@ namespace Easy
                 this.autoRecycle = autoRecycle;
                 reference = 1;
                 getResultCalled = false;
+                isForgotten = false;
+                awaiterRegistered = false;
                 result = default(T);
                 exception = null;
                 callback = null;
@@ -121,7 +178,7 @@ namespace Easy
 
         void IEasyTaskScheduleState.MarkScheduled()
         {
-            lock (syncRoot)
+            using (CreateLock())
             {
                 if (isScheduled)
                 {
@@ -138,7 +195,7 @@ namespace Easy
 
         void IEasyTaskScheduleState.RemoveFromRunner()
         {
-            lock (syncRoot)
+            using (CreateLock())
             {
                 isScheduled = false;
             }
@@ -147,14 +204,16 @@ namespace Easy
 
         public virtual void Unuse()
         {
-            lock (syncRoot)
+            using (CreateLock())
             {
                 if (isScheduled || isInPool || !autoRecycle || reference != 0 || !IsCompleted)
                 {
                     return;
                 }
 
-                OnRecycle();
+                // Mark before leaving the lock so no valid consumer can observe
+                // a partially reset object while the derived callback runs.
+                isInPool = true;
                 callback = null;
                 exception = null;
                 result = default(T);
@@ -162,9 +221,19 @@ namespace Easy
                 getResultCalled = false;
                 autoRecycle = false;
                 Volatile.Write(ref easyTaskState, (int)EasyTaskState.Pending);
-                isInPool = true;
             }
 
+            // User-defined cleanup may reenter Runner lifecycle methods. It must
+            // run outside the unlocked-operation registration, but before pooling.
+            try
+            {
+                OnRecycle();
+            }
+            catch (Exception error)
+            {
+                EasyTaskRunner.SafeLog(error.ToString());
+                return;
+            }
             ReturnToPool();
         }
 
@@ -187,18 +256,44 @@ namespace Easy
             get { return syncRoot; }
         }
 
+        protected virtual bool RequiresSynchronization
+        {
+            get
+            {
+                if (Volatile.Read(ref synchronizationRequired))
+                {
+                    return true;
+                }
+                if (EasyTaskRunner.RequiresTaskSynchronization)
+                {
+                    Volatile.Write(ref synchronizationRequired, true);
+                }
+                return synchronizationRequired;
+            }
+        }
+
+        bool IEasyTaskSynchronization.RequiresSynchronization
+        {
+            get { return RequiresSynchronization; }
+        }
+
+        internal EasyTaskLock CreateLock()
+        {
+            return new EasyTaskLock(syncRoot, this);
+        }
+
         // Must be called while holding SyncRoot.
         protected void EnsureConfigurable()
         {
-            if (isScheduled || IsCompleted || isInPool)
+            if (isScheduled || IsCompleted || isInPool || isForgotten)
             {
-                throw new InvalidOperationException("Configure the task before starting it.");
+                throw new InvalidOperationException("Configure the task before starting or forgetting it.");
             }
         }
 
         public void Retain()
         {
-            lock (syncRoot)
+            using (CreateLock())
             {
                 if (isInPool)
                 {
@@ -210,7 +305,7 @@ namespace Easy
 
         public void Release()
         {
-            lock (syncRoot)
+            using (CreateLock())
             {
                 if (reference <= 0)
                 {
@@ -226,7 +321,42 @@ namespace Easy
 
         public bool IsFree()
         {
-            lock (syncRoot) { return reference <= 0; }
+            using (CreateLock()) { return reference <= 0; }
+        }
+
+        // Declares that the caller will never await or consume this task.
+        // Internal runner/worker/builder references keep it alive until safe recycling.
+        public void Forget()
+        {
+            using (CreateLock())
+            {
+                if (isForgotten)
+                {
+                    throw new InvalidOperationException("The task has already been forgotten.");
+                }
+                if (isInPool || getResultCalled)
+                {
+                    throw new InvalidOperationException("A consumed or pooled task cannot be forgotten.");
+                }
+                if (awaiterRegistered || callback != null)
+                {
+                    throw new InvalidOperationException("A task with a registered awaiter cannot be forgotten.");
+                }
+                if (reference <= 0)
+                {
+                    throw new InvalidOperationException("The task has no consumer reference to forget.");
+                }
+
+                isForgotten = true;
+                reference--;
+            }
+
+            Unuse();
+        }
+
+        internal bool IsInPool
+        {
+            get { using (CreateLock()) { return isInPool; } }
         }
 
         public EasyTask<T> GetAwaiter()
@@ -239,11 +369,15 @@ namespace Easy
             T value;
             ExceptionDispatchInfo error;
 
-            lock (syncRoot)
+            using (CreateLock())
             {
                 if (isInPool)
                 {
                     throw new EasyTaskPoolException();
+                }
+                if (isForgotten)
+                {
+                    throw new InvalidOperationException("A forgotten task cannot be awaited.");
                 }
                 if (!IsCompleted)
                 {
@@ -275,7 +409,7 @@ namespace Easy
         public void SetResult(T value)
         {
             Action continuation = null;
-            lock (syncRoot)
+            using (CreateLock())
             {
                 if (IsCompleted || isInPool)
                 {
@@ -290,6 +424,7 @@ namespace Easy
 
             NotifyTerminated();
             InvokeContinuation(continuation);
+            Unuse();
         }
 
         public void SetException(Exception error)
@@ -301,7 +436,7 @@ namespace Easy
 
             Action continuation = null;
             EasyTaskState completedState;
-            lock (syncRoot)
+            using (CreateLock())
             {
                 if (IsCompleted || isInPool)
                 {
@@ -323,6 +458,7 @@ namespace Easy
             }
             NotifyTerminated();
             InvokeContinuation(continuation);
+            Unuse();
         }
 
         private void NotifyTerminated()
@@ -357,7 +493,7 @@ namespace Easy
 
         public EasyTask<T> SetCancellationToken(EasyCancellationToken token)
         {
-            lock (syncRoot)
+            using (CreateLock())
             {
                 EnsureConfigurable();
                 cancellationToken = token;
@@ -377,12 +513,21 @@ namespace Easy
                 throw new ArgumentNullException("continuation");
             }
 
-            lock (syncRoot)
+            using (CreateLock())
             {
                 if (isInPool)
                 {
                     throw new InvalidOperationException("An EasyTask can only be awaited once; the pooled task has already been consumed.");
                 }
+                if (isForgotten)
+                {
+                    throw new InvalidOperationException("A forgotten task cannot be awaited.");
+                }
+                if (awaiterRegistered)
+                {
+                    throw new InvalidOperationException("An EasyTask supports only one awaiter.");
+                }
+                awaiterRegistered = true;
                 if (!IsCompleted)
                 {
                     if (callback != null)
@@ -399,7 +544,7 @@ namespace Easy
 
         public Timing GetTiming()
         {
-            lock (syncRoot) { return timing; }
+            using (CreateLock()) { return timing; }
         }
 
         public virtual void MoveNext()
@@ -489,7 +634,7 @@ namespace Easy
         public EasyExecFunTask SetFunc(Action func)
         {
             if (func == null) throw new ArgumentNullException("func");
-            lock (SyncRoot)
+            using (CreateLock())
             {
                 EnsureConfigurable();
                 this.func = func;
@@ -527,6 +672,11 @@ namespace Easy
         private Func<T> func;
         private int isRunning;
 
+        protected override bool RequiresSynchronization
+        {
+            get { return base.RequiresSynchronization || Volatile.Read(ref isRunning) != 0; }
+        }
+
         protected EasyRunTask()
         {
         }
@@ -546,7 +696,7 @@ namespace Easy
         public EasyRunTask<T> SetFunc(Func<T> func)
         {
             if (func == null) throw new ArgumentNullException("func");
-            lock (SyncRoot)
+            using (CreateLock())
             {
                 EnsureConfigurable();
                 this.func = func;
@@ -607,6 +757,11 @@ namespace Easy
         private Action func;
         private int isRunning;
 
+        protected override bool RequiresSynchronization
+        {
+            get { return base.RequiresSynchronization || Volatile.Read(ref isRunning) != 0; }
+        }
+
         protected EasyRunTask()
         {
         }
@@ -626,7 +781,7 @@ namespace Easy
         public EasyRunTask SetFunc(Action func)
         {
             if (func == null) throw new ArgumentNullException("func");
-            lock (SyncRoot)
+            using (CreateLock())
             {
                 EnsureConfigurable();
                 this.func = func;
@@ -704,7 +859,7 @@ namespace Easy
         public EasyDelayTask SetDelayTime(int milli)
         {
             if (milli < 0) throw new ArgumentOutOfRangeException("milli");
-            lock (SyncRoot)
+            using (CreateLock())
             {
                 EnsureConfigurable();
                 overTimestamp = System.Diagnostics.Stopwatch.GetTimestamp()
@@ -756,7 +911,7 @@ namespace Easy
         public EasyWaitUntilTask SetCondition(Func<bool> condition)
         {
             if (condition == null) throw new ArgumentNullException("condition");
-            lock (SyncRoot)
+            using (CreateLock())
             {
                 EnsureConfigurable();
                 this.condition = condition;
@@ -820,7 +975,7 @@ namespace Easy
         public EasyWailAllTask SetWaitTasks(params IEasyTaskInterface[] tasks)
         {
             IEasyTaskInterface[] copy = ValidateAndCopyTasks(tasks, false);
-            lock (SyncRoot)
+            using (CreateLock())
             {
                 EnsureConfigurable();
                 if (easyTasks != null)
@@ -848,7 +1003,7 @@ namespace Easy
         private void ReleaseWaitTasks()
         {
             IEasyTaskInterface[] tasks;
-            lock (SyncRoot)
+            using (CreateLock())
             {
                 if (waitTasksReleased)
                 {
@@ -990,7 +1145,7 @@ namespace Easy
         public EasyWaitAnyTask SetWaitTasks(params IEasyTaskInterface[] tasks)
         {
             IEasyTaskInterface[] copy = EasyWailAllTask.ValidateAndCopyTasks(tasks, true);
-            lock (SyncRoot)
+            using (CreateLock())
             {
                 EnsureConfigurable();
                 if (easyTasks != null)
@@ -1018,7 +1173,7 @@ namespace Easy
         private void ReleaseWaitTasks()
         {
             IEasyTaskInterface[] tasks;
-            lock (SyncRoot)
+            using (CreateLock())
             {
                 if (waitTasksReleased)
                 {

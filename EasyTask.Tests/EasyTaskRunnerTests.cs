@@ -303,6 +303,7 @@ public sealed class EasyTaskRunnerTests : RunnerTestBase
     [Fact]
     public async Task ConcurrentMainTicksProduceEachResultExactlyOnce()
     {
+        EasyTaskRunner.StartThreadTiming(tickInterval: 1);
         var tasks = new ConcurrentBag<EasyRunTask<int>>();
         for (int i = 0; i < 200; i++)
         {

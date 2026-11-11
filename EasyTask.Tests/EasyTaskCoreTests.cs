@@ -87,6 +87,7 @@ public sealed class EasyTaskCoreTests : RunnerTestBase
     [Fact]
     public async Task CompletionAndRegistrationCanRaceWithoutLosingContinuation()
     {
+        EasyTaskRunner.StartThreadTiming(tickInterval: 1);
         for (int i = 0; i < 500; i++)
         {
             var task = EasyTask<int>.Create(false);
