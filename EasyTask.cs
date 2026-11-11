@@ -1,112 +1,232 @@
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
-using System.Linq;
 using System.Runtime.CompilerServices;
+using System.Runtime.ExceptionServices;
 using System.Threading;
 
 namespace Easy
 {
     [AsyncMethodBuilder(typeof(EasyAsyncGenericTaskMethodBuider<>))]
-    public class EasyTask<T> : IEasyTaskInterface, ICriticalNotifyCompletion
+    public class EasyTask<T> : IEasyTaskInterface, IEasyTaskException, ICriticalNotifyCompletion, IEasyTaskScheduleState
     {
         protected static readonly ConcurrentQueue<EasyTask<T>> queue = new ConcurrentQueue<EasyTask<T>>();
+
+        private readonly object syncRoot = new object();
+        private int easyTaskState;
+        private ExceptionDispatchInfo exception;
+        private Action callback;
+        private bool hasBeenUsed;
+        private bool isScheduled;
+
+        protected T result;
+        protected bool autoRecycle;
+        protected Timing timing;
+        protected int reference;
+        protected bool isInPool;
+        protected bool getResultCalled;
+
+        protected EasyTask()
+        {
+            easyTaskState = (int)EasyTaskState.Pending;
+            timing = Timing.Main;
+        }
 
         public static Timing CheckTiming(Timing timing)
         {
             if (timing == Timing.Auto)
             {
-                timing = EasyTaskRunner.IsStartThreadTiming && Thread.CurrentThread.ManagedThreadId != 1 ? Timing.Thread : Timing.Main;
+                return EasyTaskRunner.IsStartThreadTiming && !EasyTaskRunner.IsMainThread
+                    ? Timing.Thread
+                    : Timing.Main;
             }
-            else if(timing == Timing.Thread && !EasyTaskRunner.IsStartThreadTiming)
+
+            if (timing == Timing.Thread && !EasyTaskRunner.IsStartThreadTiming)
             {
                 throw new EasyTaskRunnerThreadException();
             }
-            return timing;
-        } 
-        public static EasyTask<T> Create(bool autoRecycle = false, Timing timing = Timing.Auto)
-        {
-            EasyTask<T> t;
-            if (!queue.TryDequeue(out t))
+
+            if (timing != Timing.Main && timing != Timing.Thread)
             {
-                t = new EasyTask<T>();
+                throw new ArgumentOutOfRangeException("timing");
             }
-            t.Reuse(timing, autoRecycle);
-            return t;
+
+            return timing;
         }
 
-        private EasyTaskState easyTaskState;
+        public static EasyTask<T> Create(bool autoRecycle = false, Timing timing = Timing.Auto)
+        {
+            Timing checkedTiming = CheckTiming(timing);
+            EasyTask<T> task;
+            if (!queue.TryDequeue(out task))
+            {
+                task = new EasyTask<T>();
+            }
+
+            task.Reuse(checkedTiming, autoRecycle);
+            return task;
+        }
 
         public EasyTaskState EasyTaskState
         {
-            get
-            {
-                return easyTaskState;
-            }
-            set
-            {
-                easyTaskState = value;
-                if (easyTaskState == EasyTaskState.Completed)
-                {
-                    callback?.Invoke();
-                }
-            }
+            get { return (EasyTaskState)Volatile.Read(ref easyTaskState); }
+        }
+
+        public EasyCancellationToken EasyCancellationToken
+        {
+            get { lock (syncRoot) { return cancellationToken; } }
         }
 
         private EasyCancellationToken cancellationToken;
-        public EasyCancellationToken EasyCancellationToken => cancellationToken;
-        public Action callback;
-        protected T result;
-        protected bool autoRecycle = false;
-        protected Timing timing = Timing.Main;
-        protected int reference = 0;
-        protected bool isInPool = false; 
-        protected bool getResultCalled = false;
 
-        protected EasyTask()
+        public Exception Exception
         {
+            get { lock (syncRoot) { return exception == null ? null : exception.SourceException; } }
+        }
 
+        public bool IsCompleted
+        {
+            get { return EasyTaskState != EasyTaskState.Pending; }
         }
 
         public virtual void Reuse(Timing timing, bool autoRecycle)
         {
-            this.timing = CheckTiming(timing);
-            this.autoRecycle = autoRecycle;
-            isInPool = false;
-            getResultCalled = false;
+            Timing checkedTiming = CheckTiming(timing);
+            lock (syncRoot)
+            {
+                if (isScheduled || (hasBeenUsed && !isInPool))
+                {
+                    throw new InvalidOperationException("Only a new or pooled task can be reused.");
+                }
+
+                hasBeenUsed = true;
+                isInPool = false;
+                this.timing = checkedTiming;
+                this.autoRecycle = autoRecycle;
+                reference = 1;
+                getResultCalled = false;
+                result = default(T);
+                exception = null;
+                callback = null;
+                cancellationToken = null;
+                Volatile.Write(ref easyTaskState, (int)EasyTaskState.Pending);
+            }
+        }
+
+        // A task must be fully configured before it is published to the runner.
+        public void Start()
+        {
             EasyTaskRunner.AddTask(this);
-            Retain();
+        }
+
+        void IEasyTaskScheduleState.MarkScheduled()
+        {
+            lock (syncRoot)
+            {
+                if (isScheduled)
+                {
+                    throw new InvalidOperationException("The task has already been scheduled.");
+                }
+                if (isInPool || IsCompleted)
+                {
+                    throw new InvalidOperationException("A pooled or completed task cannot be scheduled.");
+                }
+
+                isScheduled = true;
+            }
+        }
+
+        void IEasyTaskScheduleState.RemoveFromRunner()
+        {
+            lock (syncRoot)
+            {
+                isScheduled = false;
+            }
+            Unuse();
         }
 
         public virtual void Unuse()
         {
-            if (!autoRecycle)
+            lock (syncRoot)
             {
-                return;
+                if (isScheduled || isInPool || !autoRecycle || reference != 0 || !IsCompleted)
+                {
+                    return;
+                }
+
+                OnRecycle();
+                callback = null;
+                exception = null;
+                result = default(T);
+                cancellationToken = null;
+                getResultCalled = false;
+                autoRecycle = false;
+                Volatile.Write(ref easyTaskState, (int)EasyTaskState.Pending);
+                isInPool = true;
             }
-            isInPool = true;
-            getResultCalled = false;
-            autoRecycle = false;
-            this.callback = null;
-            result = default;
-            easyTaskState = EasyTaskState.Pending;
-            cancellationToken = null;
+
+            ReturnToPool();
+        }
+
+        protected virtual void ReturnToPool()
+        {
             queue.Enqueue(this);
+        }
+
+        protected virtual void OnRecycle()
+        {
+        }
+
+        // Called once after the terminal state is published and before awaiters resume.
+        protected virtual void OnTerminate()
+        {
+        }
+
+        protected object SyncRoot
+        {
+            get { return syncRoot; }
+        }
+
+        // Must be called while holding SyncRoot.
+        protected void EnsureConfigurable()
+        {
+            if (isScheduled || IsCompleted || isInPool)
+            {
+                throw new InvalidOperationException("Configure the task before starting it.");
+            }
         }
 
         public void Retain()
         {
-            Interlocked.Increment(ref reference);
+            lock (syncRoot)
+            {
+                if (isInPool)
+                {
+                    throw new EasyTaskPoolException();
+                }
+                reference++;
+            }
         }
 
         public void Release()
         {
-            Interlocked.Decrement(ref reference);
+            lock (syncRoot)
+            {
+                if (reference <= 0)
+                {
+                    throw new InvalidOperationException("The task reference count cannot be released below zero.");
+                }
+                reference--;
+            }
+
+            // The runner may already have removed this completed task. In that
+            // case the final releaser is responsible for returning it to the pool.
+            Unuse();
         }
 
         public bool IsFree()
         {
-            return reference <= 0;
+            lock (syncRoot) { return reference <= 0; }
         }
 
         public EasyTask<T> GetAwaiter()
@@ -114,46 +234,134 @@ namespace Easy
             return this;
         }
 
-        public bool IsCompleted => easyTaskState != EasyTaskState.Pending;
-
-    
         public virtual T GetResult()
         {
-            if (isInPool)
+            T value;
+            ExceptionDispatchInfo error;
+
+            lock (syncRoot)
             {
-                throw new EasyTaskPoolException();
-            }
-            if (!getResultCalled)
-            {
+                if (isInPool)
+                {
+                    throw new EasyTaskPoolException();
+                }
+                if (!IsCompleted)
+                {
+                    throw new InvalidOperationException("The task has not completed.");
+                }
+                if (getResultCalled)
+                {
+                    throw new InvalidOperationException("An EasyTask can only be awaited once.");
+                }
+
                 getResultCalled = true;
-                Release();
+                value = result;
+                error = exception;
+                if (reference <= 0)
+                {
+                    throw new InvalidOperationException("The task has no consumer reference to release.");
+                }
+                reference--;
             }
-            T tmp = result;
-            return tmp;
-        }
 
-        public void SetResult(T t)
-        {
-            result = t;
-            EasyTaskState = EasyTaskState.Completed;
-        }
-
-        public void SetException(Exception e)
-        {
-            if (e is EasyCancelException)
+            Unuse();
+            if (error != null)
             {
-                EasyTaskState = EasyTaskState.Canceled;
+                error.Throw();
             }
-            else
-            {
-                EasyTaskState = EasyTaskState.Faulted;
-            }
-            EasyTaskRunner.Log?.Invoke(e.ToString());
+            return value;
         }
 
-        public EasyTask<T> SetCancellationToken(EasyCancellationToken cancellationToken)
+        public void SetResult(T value)
         {
-            this.cancellationToken = cancellationToken;
+            Action continuation = null;
+            lock (syncRoot)
+            {
+                if (IsCompleted || isInPool)
+                {
+                    return;
+                }
+
+                result = value;
+                continuation = callback;
+                callback = null;
+                Volatile.Write(ref easyTaskState, (int)EasyTaskState.Completed);
+            }
+
+            NotifyTerminated();
+            InvokeContinuation(continuation);
+        }
+
+        public void SetException(Exception error)
+        {
+            if (error == null)
+            {
+                throw new ArgumentNullException("error");
+            }
+
+            Action continuation = null;
+            EasyTaskState completedState;
+            lock (syncRoot)
+            {
+                if (IsCompleted || isInPool)
+                {
+                    return;
+                }
+
+                exception = ExceptionDispatchInfo.Capture(error);
+                completedState = error is OperationCanceledException
+                    ? EasyTaskState.Canceled
+                    : EasyTaskState.Faulted;
+                continuation = callback;
+                callback = null;
+                Volatile.Write(ref easyTaskState, (int)completedState);
+            }
+
+            if (completedState == EasyTaskState.Faulted)
+            {
+                EasyTaskRunner.SafeLog(error.ToString());
+            }
+            NotifyTerminated();
+            InvokeContinuation(continuation);
+        }
+
+        private void NotifyTerminated()
+        {
+            try
+            {
+                OnTerminate();
+            }
+            catch (Exception error)
+            {
+                EasyTaskRunner.SafeLog(error.ToString());
+            }
+        }
+
+        private static void InvokeContinuation(Action continuation)
+        {
+            if (continuation == null)
+            {
+                return;
+            }
+
+            try
+            {
+                continuation();
+            }
+            catch (Exception error)
+            {
+                // A continuation must not terminate the scheduler or a ThreadPool worker.
+                EasyTaskRunner.SafeLog(error.ToString());
+            }
+        }
+
+        public EasyTask<T> SetCancellationToken(EasyCancellationToken token)
+        {
+            lock (syncRoot)
+            {
+                EnsureConfigurable();
+                cancellationToken = token;
+            }
             return this;
         }
 
@@ -164,22 +372,38 @@ namespace Easy
 
         public void UnsafeOnCompleted(Action continuation)
         {
-            if (IsCompleted)
+            if (continuation == null)
             {
-                continuation?.Invoke();
-                return;
+                throw new ArgumentNullException("continuation");
             }
-            callback = continuation;
+
+            lock (syncRoot)
+            {
+                if (isInPool)
+                {
+                    throw new InvalidOperationException("An EasyTask can only be awaited once; the pooled task has already been consumed.");
+                }
+                if (!IsCompleted)
+                {
+                    if (callback != null)
+                    {
+                        throw new InvalidOperationException("An EasyTask supports only one awaiter.");
+                    }
+                    callback = continuation;
+                    return;
+                }
+            }
+
+            InvokeContinuation(continuation);
         }
 
         public Timing GetTiming()
         {
-            return timing;
+            lock (syncRoot) { return timing; }
         }
 
         public virtual void MoveNext()
         {
-
         }
     }
 
@@ -187,40 +411,52 @@ namespace Easy
     public class EasyVoidTask : EasyTask<object>
     {
         protected new static readonly ConcurrentQueue<EasyVoidTask> queue = new ConcurrentQueue<EasyVoidTask>();
-        public new static EasyVoidTask Create(bool autoRecycle = false, Timing timing = Timing.Auto)
-        {
-            EasyVoidTask t;
-            if (!queue.TryDequeue(out t))
-            {
-                t = new EasyVoidTask();
-            }
-            t.Reuse(timing, autoRecycle);
-            return t;
-        }
 
         protected EasyVoidTask()
         {
+        }
 
+        public new static EasyVoidTask Create(bool autoRecycle = false, Timing timing = Timing.Auto)
+        {
+            Timing checkedTiming = CheckTiming(timing);
+            EasyVoidTask task;
+            if (!queue.TryDequeue(out task))
+            {
+                task = new EasyVoidTask();
+            }
+            task.Reuse(checkedTiming, autoRecycle);
+            return task;
+        }
+
+        protected override void ReturnToPool()
+        {
+            queue.Enqueue(this);
         }
     }
 
     public class EasyYieldTask : EasyVoidTask
     {
         protected new static readonly ConcurrentQueue<EasyYieldTask> queue = new ConcurrentQueue<EasyYieldTask>();
-        public new static EasyYieldTask Create(bool autoRecycle = false, Timing timing = Timing.Auto)
-        {
-            EasyYieldTask t;
-            if (!queue.TryDequeue(out t))
-            {
-                t = new EasyYieldTask();
-            }
-            t.Reuse(timing, autoRecycle);
-            return t;
-        }
 
         protected EasyYieldTask()
         {
+        }
 
+        public new static EasyYieldTask Create(bool autoRecycle = false, Timing timing = Timing.Auto)
+        {
+            Timing checkedTiming = CheckTiming(timing);
+            EasyYieldTask task;
+            if (!queue.TryDequeue(out task))
+            {
+                task = new EasyYieldTask();
+            }
+            task.Reuse(checkedTiming, autoRecycle);
+            return task;
+        }
+
+        protected override void ReturnToPool()
+        {
+            queue.Enqueue(this);
         }
 
         public override void MoveNext()
@@ -232,188 +468,264 @@ namespace Easy
     public class EasyExecFunTask : EasyVoidTask
     {
         protected new static readonly ConcurrentQueue<EasyExecFunTask> queue = new ConcurrentQueue<EasyExecFunTask>();
-        public new static EasyExecFunTask Create(bool autoRecycle = false, Timing timing = Timing.Auto)
-        {
-            EasyExecFunTask t;
-            if (!queue.TryDequeue(out t))
-            {
-                t = new EasyExecFunTask();
-            }
-            t.Reuse(timing, autoRecycle);
-            return t;
-        }
-
         private Action func;
 
         protected EasyExecFunTask()
         {
-
         }
 
-        public override void Unuse()
+        public new static EasyExecFunTask Create(bool autoRecycle = false, Timing timing = Timing.Auto)
         {
-            func = null;
-            base.Unuse();
+            Timing checkedTiming = CheckTiming(timing);
+            EasyExecFunTask task;
+            if (!queue.TryDequeue(out task))
+            {
+                task = new EasyExecFunTask();
+            }
+            task.Reuse(checkedTiming, autoRecycle);
+            return task;
         }
 
         public EasyExecFunTask SetFunc(Action func)
         {
-            this.func = func;
+            if (func == null) throw new ArgumentNullException("func");
+            lock (SyncRoot)
+            {
+                EnsureConfigurable();
+                this.func = func;
+            }
             return this;
+        }
+
+        protected override void OnRecycle()
+        {
+            func = null;
+        }
+
+        protected override void ReturnToPool()
+        {
+            queue.Enqueue(this);
         }
 
         public override void MoveNext()
         {
-            func?.Invoke();
-            SetResult(null);       
+            try
+            {
+                func();
+                SetResult(null);
+            }
+            catch (Exception error)
+            {
+                SetException(error);
+            }
         }
     }
 
     public class EasyRunTask<T> : EasyTask<T>
     {
         protected new static readonly ConcurrentQueue<EasyRunTask<T>> queue = new ConcurrentQueue<EasyRunTask<T>>();
-        public new static EasyRunTask<T> Create(bool autoRecycle = false, Timing timing = Timing.Auto)
-        {
-            EasyRunTask<T> t;
-            if (!queue.TryDequeue(out t))
-            {
-                t = new EasyRunTask<T>();
-            }
-            t.Reuse(timing, autoRecycle);
-            return t;
-        }
-
         private Func<T> func;
-        private bool isRunning;
+        private int isRunning;
 
         protected EasyRunTask()
         {
-
         }
 
-        public override void Unuse()
+        public new static EasyRunTask<T> Create(bool autoRecycle = false, Timing timing = Timing.Auto)
         {
-            func = null;
-            isRunning = false;
-            base.Unuse();
+            Timing checkedTiming = CheckTiming(timing);
+            EasyRunTask<T> task;
+            if (!queue.TryDequeue(out task))
+            {
+                task = new EasyRunTask<T>();
+            }
+            task.Reuse(checkedTiming, autoRecycle);
+            return task;
         }
-
 
         public EasyRunTask<T> SetFunc(Func<T> func)
         {
-            this.func = func;
+            if (func == null) throw new ArgumentNullException("func");
+            lock (SyncRoot)
+            {
+                EnsureConfigurable();
+                this.func = func;
+            }
             return this;
+        }
+
+        protected override void OnRecycle()
+        {
+            func = null;
+            isRunning = 0;
+        }
+
+        protected override void ReturnToPool()
+        {
+            queue.Enqueue(this);
         }
 
         public override void MoveNext()
         {
-            if (isRunning)
-                return;
-            if (ThreadPool.QueueUserWorkItem(Run))
+            if (IsCompleted || Interlocked.CompareExchange(ref isRunning, 1, 0) != 0)
             {
-                isRunning = true;
+                return;
+            }
+
+            // Cancellation may complete the awaitable before the worker exits.
+            // Keep a worker reference so the object cannot be reused in between.
+            Retain();
+            if (!ThreadPool.QueueUserWorkItem(Run))
+            {
+                Interlocked.Exchange(ref isRunning, 0);
+                SetException(new InvalidOperationException("The work item could not be queued."));
+                Release();
             }
         }
 
-        private void Run(object result)
+        private void Run(object state)
         {
-            if (func == null)
+            try
             {
-                SetResult(default);
+                Func<T> currentFunc = func;
+                SetResult(currentFunc());
             }
-            else
+            catch (Exception error)
             {
-                SetResult(func());
+                SetException(error);
             }
-
+            finally
+            {
+                Release();
+            }
         }
     }
 
     public class EasyRunTask : EasyVoidTask
     {
         protected new static readonly ConcurrentQueue<EasyRunTask> queue = new ConcurrentQueue<EasyRunTask>();
-        public new static EasyRunTask Create(bool autoRecycle = false, Timing timing = Timing.Auto)
-        {
-            EasyRunTask t;
-            if (!queue.TryDequeue(out t))
-            {
-                t = new EasyRunTask();
-            }
-            t.Reuse(timing, autoRecycle);
-            return t;
-        }
-
         private Action func;
-        private bool isRunning;
+        private int isRunning;
 
         protected EasyRunTask()
         {
-
         }
 
-        public override void Unuse()
+        public new static EasyRunTask Create(bool autoRecycle = false, Timing timing = Timing.Auto)
         {
-            func = null;
-            isRunning = false;
-            base.Unuse();
+            Timing checkedTiming = CheckTiming(timing);
+            EasyRunTask task;
+            if (!queue.TryDequeue(out task))
+            {
+                task = new EasyRunTask();
+            }
+            task.Reuse(checkedTiming, autoRecycle);
+            return task;
         }
 
         public EasyRunTask SetFunc(Action func)
         {
-            this.func = func;
+            if (func == null) throw new ArgumentNullException("func");
+            lock (SyncRoot)
+            {
+                EnsureConfigurable();
+                this.func = func;
+            }
             return this;
+        }
+
+        protected override void OnRecycle()
+        {
+            func = null;
+            isRunning = 0;
+        }
+
+        protected override void ReturnToPool()
+        {
+            queue.Enqueue(this);
         }
 
         public override void MoveNext()
         {
-            if (isRunning)
-                return;
-            if (ThreadPool.QueueUserWorkItem(Run))
+            if (IsCompleted || Interlocked.CompareExchange(ref isRunning, 1, 0) != 0)
             {
-                isRunning = true;
+                return;
+            }
+
+            Retain();
+            if (!ThreadPool.QueueUserWorkItem(Run))
+            {
+                Interlocked.Exchange(ref isRunning, 0);
+                SetException(new InvalidOperationException("The work item could not be queued."));
+                Release();
             }
         }
 
-        private void Run(object result)
+        private void Run(object state)
         {
-            func.Invoke();
-            SetResult(null);
+            try
+            {
+                Action currentFunc = func;
+                currentFunc();
+                SetResult(null);
+            }
+            catch (Exception error)
+            {
+                SetException(error);
+            }
+            finally
+            {
+                Release();
+            }
         }
     }
 
     public class EasyDelayTask : EasyVoidTask
     {
         protected new static readonly ConcurrentQueue<EasyDelayTask> queue = new ConcurrentQueue<EasyDelayTask>();
-        public new static EasyDelayTask Create(bool autoRecycle = false, Timing timing = Timing.Auto)
-        {
-            EasyDelayTask t;
-            if (!queue.TryDequeue(out t))
-            {
-                t = new EasyDelayTask();
-            }
-            t.Reuse(timing, autoRecycle);
-            return t;
-        }
-
-        private long overTime;
+        private long overTimestamp;
 
         protected EasyDelayTask()
         {
+        }
 
+        public new static EasyDelayTask Create(bool autoRecycle = false, Timing timing = Timing.Auto)
+        {
+            Timing checkedTiming = CheckTiming(timing);
+            EasyDelayTask task;
+            if (!queue.TryDequeue(out task))
+            {
+                task = new EasyDelayTask();
+            }
+            task.Reuse(checkedTiming, autoRecycle);
+            return task;
         }
 
         public EasyDelayTask SetDelayTime(int milli)
         {
-            overTime = DateTime.UtcNow.Ticks + TimeSpan.TicksPerMillisecond * milli;
+            if (milli < 0) throw new ArgumentOutOfRangeException("milli");
+            lock (SyncRoot)
+            {
+                EnsureConfigurable();
+                overTimestamp = System.Diagnostics.Stopwatch.GetTimestamp()
+                    + (long)milli * System.Diagnostics.Stopwatch.Frequency / 1000L;
+            }
             return this;
         }
+
+        protected override void OnRecycle()
+        {
+            overTimestamp = 0;
+        }
+
+        protected override void ReturnToPool()
+        {
+            queue.Enqueue(this);
+        }
+
         public override void MoveNext()
         {
-            if (IsCompleted)
-            {
-                return;
-            }
-            if (DateTime.UtcNow.Ticks >= overTime)
+            if (!IsCompleted && System.Diagnostics.Stopwatch.GetTimestamp() >= overTimestamp)
             {
                 SetResult(null);
             }
@@ -423,49 +735,62 @@ namespace Easy
     public class EasyWaitUntilTask : EasyVoidTask
     {
         protected new static readonly ConcurrentQueue<EasyWaitUntilTask> queue = new ConcurrentQueue<EasyWaitUntilTask>();
-        public new static EasyWaitUntilTask Create(bool autoRecycle = false, Timing timing = Timing.Auto)
-        {
-            EasyWaitUntilTask t;
-            if (!queue.TryDequeue(out t))
-            {
-                t = new EasyWaitUntilTask();
-            }
-            t.Reuse(timing, autoRecycle);
-            return t;
-        }
-
         private Func<bool> condition;
 
         protected EasyWaitUntilTask()
         {
-
         }
 
-        public override void Unuse()
+        public new static EasyWaitUntilTask Create(bool autoRecycle = false, Timing timing = Timing.Auto)
         {
-            condition = null;
-            base.Unuse();
+            Timing checkedTiming = CheckTiming(timing);
+            EasyWaitUntilTask task;
+            if (!queue.TryDequeue(out task))
+            {
+                task = new EasyWaitUntilTask();
+            }
+            task.Reuse(checkedTiming, autoRecycle);
+            return task;
         }
 
         public EasyWaitUntilTask SetCondition(Func<bool> condition)
         {
-            this.condition = condition;
+            if (condition == null) throw new ArgumentNullException("condition");
+            lock (SyncRoot)
+            {
+                EnsureConfigurable();
+                this.condition = condition;
+            }
             return this;
         }
+
+        protected override void OnRecycle()
+        {
+            condition = null;
+        }
+
+        protected override void ReturnToPool()
+        {
+            queue.Enqueue(this);
+        }
+
         public override void MoveNext()
         {
             if (IsCompleted)
             {
                 return;
             }
-            if (condition == null)
+
+            try
             {
-                SetResult(null);
-                return;
+                if (condition())
+                {
+                    SetResult(null);
+                }
             }
-            if (condition())
+            catch (Exception error)
             {
-                SetResult(null);
+                SetException(error);
             }
         }
     }
@@ -473,57 +798,79 @@ namespace Easy
     public class EasyWailAllTask : EasyVoidTask
     {
         protected new static readonly ConcurrentQueue<EasyWailAllTask> queue = new ConcurrentQueue<EasyWailAllTask>();
-        public new static EasyWailAllTask Create(bool autoRecycle = false, Timing timing = Timing.Auto)
-        {
-            EasyWailAllTask t;
-            if (!queue.TryDequeue(out t))
-            {
-                t = new EasyWailAllTask();
-            }
-            t.Reuse(timing, autoRecycle);
-            return t;
-        }
-
         private IEasyTaskInterface[] easyTasks;
+        private bool waitTasksReleased;
 
         protected EasyWailAllTask()
         {
-
         }
 
-        public override void Unuse()
+        public new static EasyWailAllTask Create(bool autoRecycle = false, Timing timing = Timing.Auto)
         {
-            easyTasks = null;
-            base.Unuse();
+            Timing checkedTiming = CheckTiming(timing);
+            EasyWailAllTask task;
+            if (!queue.TryDequeue(out task))
+            {
+                task = new EasyWailAllTask();
+            }
+            task.Reuse(checkedTiming, autoRecycle);
+            return task;
         }
 
         public EasyWailAllTask SetWaitTasks(params IEasyTaskInterface[] tasks)
         {
-            easyTasks = tasks;
-            for (int i = 0; i < easyTasks.Length; i++)
+            IEasyTaskInterface[] copy = ValidateAndCopyTasks(tasks, false);
+            lock (SyncRoot)
             {
-                easyTasks[i].Retain();
+                EnsureConfigurable();
+                if (easyTasks != null)
+                {
+                    throw new InvalidOperationException("Wait tasks can only be assigned once.");
+                }
+                easyTasks = copy;
+                RetainTasks(easyTasks);
+                waitTasksReleased = false;
             }
             return this;
         }
 
-        public override object GetResult()
+        protected override void OnTerminate()
         {
-            if (isInPool)
+            ReleaseWaitTasks();
+        }
+
+        protected override void OnRecycle()
+        {
+            ReleaseWaitTasks();
+            easyTasks = null;
+        }
+
+        private void ReleaseWaitTasks()
+        {
+            IEasyTaskInterface[] tasks;
+            lock (SyncRoot)
             {
-                throw new EasyTaskPoolException();
-            }
-            if (!getResultCalled)
-            {
-                getResultCalled = true;
-                Release();
-                for (int i = 0; i < easyTasks.Length; i++)
+                if (waitTasksReleased)
                 {
-                    easyTasks[i].Release();
+                    return;
                 }
+                waitTasksReleased = true;
+                tasks = easyTasks;
             }
-            object tmp = result;
-            return tmp;
+
+            if (tasks == null)
+            {
+                return;
+            }
+            for (int i = 0; i < tasks.Length; i++)
+            {
+                tasks[i].Release();
+            }
+        }
+
+        protected override void ReturnToPool()
+        {
+            queue.Enqueue(this);
         }
 
         public override void MoveNext()
@@ -532,35 +879,88 @@ namespace Easy
             {
                 return;
             }
-            int completedNum = 0;
-            int faultedNum = 0;
-            int cancelNum = 0;
-            for (int i = easyTasks.Length - 1; i >= 0; --i)
+
+            int terminalCount = 0;
+            int canceledCount = 0;
+            List<Exception> errors = null;
+
+            for (int i = 0; i < easyTasks.Length; i++)
             {
-                if (easyTasks[i].EasyTaskState == EasyTaskState.Completed)
+                switch (easyTasks[i].EasyTaskState)
                 {
-                    completedNum++;
-                }
-                else if (easyTasks[i].EasyTaskState == EasyTaskState.Faulted)
-                {
-                    faultedNum++;
-                }
-                else if (easyTasks[i].EasyTaskState == EasyTaskState.Canceled)
-                {
-                    cancelNum++;
+                    case EasyTaskState.Completed:
+                        terminalCount++;
+                        break;
+                    case EasyTaskState.Canceled:
+                        terminalCount++;
+                        canceledCount++;
+                        break;
+                    case EasyTaskState.Faulted:
+                        terminalCount++;
+                        if (errors == null) errors = new List<Exception>();
+                        IEasyTaskException exceptionSource = easyTasks[i] as IEasyTaskException;
+                        errors.Add(exceptionSource == null || exceptionSource.Exception == null
+                            ? new Exception("A task faulted without an exception.")
+                            : exceptionSource.Exception);
+                        break;
                 }
             }
-            if (faultedNum != 0)
+
+            if (terminalCount != easyTasks.Length)
             {
-                SetException(new Exception("Has Task Faulted"));
+                return;
             }
-            else if (cancelNum != 0)
+            if (errors != null)
             {
-                SetException(new Exception("Has Task Canceled"));
+                SetException(errors.Count == 1 ? errors[0] : new AggregateException(errors));
             }
-            else if (completedNum == easyTasks.Length)
+            else if (canceledCount != 0)
+            {
+                SetException(new EasyCancelException());
+            }
+            else
             {
                 SetResult(null);
+            }
+        }
+
+        internal static IEasyTaskInterface[] ValidateAndCopyTasks(IEasyTaskInterface[] tasks, bool requireNonEmpty)
+        {
+            if (tasks == null) throw new ArgumentNullException("tasks");
+            if (requireNonEmpty && tasks.Length == 0)
+            {
+                throw new ArgumentException("WaitAny requires at least one task.", "tasks");
+            }
+
+            var copy = new IEasyTaskInterface[tasks.Length];
+            for (int i = 0; i < tasks.Length; i++)
+            {
+                if (tasks[i] == null)
+                {
+                    throw new ArgumentException("The task array cannot contain null.", "tasks");
+                }
+                copy[i] = tasks[i];
+            }
+            return copy;
+        }
+
+        internal static void RetainTasks(IEasyTaskInterface[] tasks)
+        {
+            int retained = 0;
+            try
+            {
+                for (; retained < tasks.Length; retained++)
+                {
+                    tasks[retained].Retain();
+                }
+            }
+            catch
+            {
+                for (int i = 0; i < retained; i++)
+                {
+                    tasks[i].Release();
+                }
+                throw;
             }
         }
     }
@@ -568,57 +968,79 @@ namespace Easy
     public class EasyWaitAnyTask : EasyTask<int>
     {
         protected new static readonly ConcurrentQueue<EasyWaitAnyTask> queue = new ConcurrentQueue<EasyWaitAnyTask>();
-        public new static EasyWaitAnyTask Create(bool autoRecycle = false, Timing timing = Timing.Auto)
-        {
-            EasyWaitAnyTask t;
-            if (!queue.TryDequeue(out t))
-            {
-                t = new EasyWaitAnyTask();
-            }
-            t.Reuse(timing, autoRecycle);
-            return t;
-        }
-
         private IEasyTaskInterface[] easyTasks;
+        private bool waitTasksReleased;
 
         protected EasyWaitAnyTask()
         {
-
         }
 
-        public override void Unuse()
+        public new static EasyWaitAnyTask Create(bool autoRecycle = false, Timing timing = Timing.Auto)
         {
-            easyTasks = null;
-            base.Unuse();
+            Timing checkedTiming = CheckTiming(timing);
+            EasyWaitAnyTask task;
+            if (!queue.TryDequeue(out task))
+            {
+                task = new EasyWaitAnyTask();
+            }
+            task.Reuse(checkedTiming, autoRecycle);
+            return task;
         }
 
         public EasyWaitAnyTask SetWaitTasks(params IEasyTaskInterface[] tasks)
         {
-            easyTasks = tasks;
-            for (int i = 0; i < easyTasks.Length; i++)
+            IEasyTaskInterface[] copy = EasyWailAllTask.ValidateAndCopyTasks(tasks, true);
+            lock (SyncRoot)
             {
-                easyTasks[i].Retain();
+                EnsureConfigurable();
+                if (easyTasks != null)
+                {
+                    throw new InvalidOperationException("Wait tasks can only be assigned once.");
+                }
+                easyTasks = copy;
+                EasyWailAllTask.RetainTasks(easyTasks);
+                waitTasksReleased = false;
             }
             return this;
         }
 
-        public override int GetResult()
+        protected override void OnTerminate()
         {
-            if (isInPool)
+            ReleaseWaitTasks();
+        }
+
+        protected override void OnRecycle()
+        {
+            ReleaseWaitTasks();
+            easyTasks = null;
+        }
+
+        private void ReleaseWaitTasks()
+        {
+            IEasyTaskInterface[] tasks;
+            lock (SyncRoot)
             {
-                throw new EasyTaskPoolException();
-            }
-            if (!getResultCalled)
-            {
-                getResultCalled = true;
-                Release();
-                for (int i = 0; i < easyTasks.Length; i++)
+                if (waitTasksReleased)
                 {
-                    easyTasks[i].Release();
+                    return;
                 }
+                waitTasksReleased = true;
+                tasks = easyTasks;
             }
-            int tmp = result;
-            return tmp;
+
+            if (tasks == null)
+            {
+                return;
+            }
+            for (int i = 0; i < tasks.Length; i++)
+            {
+                tasks[i].Release();
+            }
+        }
+
+        protected override void ReturnToPool()
+        {
+            queue.Enqueue(this);
         }
 
         public override void MoveNext()
@@ -627,32 +1049,14 @@ namespace Easy
             {
                 return;
             }
-            int completedIndex = -1;
-            int faultedNum = 0;
-            int cancelNum = 0;
-            for (int i = easyTasks.Length - 1; i >= 0; --i)
+
+            for (int i = 0; i < easyTasks.Length; i++)
             {
-                if (easyTasks[i].EasyTaskState == EasyTaskState.Completed)
+                if (easyTasks[i].EasyTaskState != EasyTaskState.Pending)
                 {
-                    completedIndex = i;
-                    break;
+                    SetResult(i);
+                    return;
                 }
-                else if (easyTasks[i].EasyTaskState == EasyTaskState.Faulted)
-                {
-                    faultedNum++;
-                }
-                else if (easyTasks[i].EasyTaskState == EasyTaskState.Canceled)
-                {
-                    cancelNum++;
-                }
-            }
-            if (faultedNum + cancelNum == easyTasks.Length)
-            {
-                SetException(new Exception("All Task Faulted Or Canceled"));
-            }
-            else if (completedIndex != -1)
-            {
-                SetResult(completedIndex);
             }
         }
     }
